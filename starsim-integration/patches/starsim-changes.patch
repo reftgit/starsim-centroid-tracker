@@ -1,0 +1,272 @@
+--- a/src/starsim/render/renderer.py
++++ b/src/starsim/render/renderer.py
+@@ -179,6 +179,7 @@
+         ra_rate: float = 0.0,
+         dec_rate: float = 0.0,
+         roll_rate: float = 0.0,
++        return_truth: bool = False,
+     ) -> NDArray[np.float64]:
+         """
+         Render a star field image from a list of stars.
+@@ -218,7 +219,7 @@
+         if not stars:
+             if add_noise:
+                 image = self._apply_noise_pipeline(image, exp_time, seed, fast_mode)
+-            return image
++            return (image, []) if return_truth else image
+         
+         # Extract star coordinates and magnitudes
+         ra_array = np.array([s.ra for s in stars])
+@@ -256,10 +257,16 @@
+             trail_dy = y_end - y_coords
+             motion_psf = SmearedPSF(self.psf)
+ 
++        # Ground truth: her gorunur yildizin piksel konumu (streak varsa cizgi ortasi)
++        truth = []  # (x, y, mag, star_id)
++
+         for idx in valid_indices:
+             x = x_coords[idx]
+             y = y_coords[idx]
+             mag = mag_array[idx]
++            # Katalog kimligi (orn. "HIP24436" / "GAIA...").  idx dogrudan stars
++            # listesinin indeksi: ra_array/mag_array ayni siradan kuruluyor.
++            sid = stars[idx].star_id or ""
+ 
+             # Skip invalid projections
+             if np.isnan(x) or np.isnan(y):
+@@ -277,14 +284,26 @@
+                     image, x=x, y=y, intensity=intensity,
+                     trail_dx=trail_dx[idx], trail_dy=trail_dy[idx],
+                 )
++                # Ground truth = goruntunun streak'i CIZDIGI merkez.
++                # SmearedPSF izi (x,y) etrafinda SIMETRIK cizer (linspace -half..+half),
++                # yani gorsel agirlik merkezi tam (x,y)'de = poz basi konumu.
++                # Onceki hali (x + trail/2, poz ortasi) yarim-iz kayma yaratiyordu:
++                # ra/dec'te sabit ~yarim-poz oteleme, roll'da aci ofseti.
++                gx = x
++                gy = y
+             else:
+                 self.psf.apply(image, x=x, y=y, intensity=intensity)
++                gx, gy = x, y
++
++            # Sadece goruntu icindeki yildizlari ground truth'a kaydet
++            if 0.0 <= gx < self.config.image_width and 0.0 <= gy < self.config.image_height:
++                truth.append((float(gx), float(gy), float(mag), sid))
+         
+         # Add noise if requested
+         if add_noise:
+             image = self._apply_noise_pipeline(image, exp_time, seed, fast_mode)
+         
+-        return image
++        return (image, truth) if return_truth else image
+     
+     def _apply_noise_pipeline(
+         self,
+--- a/src/starsim/render/realtime.py
++++ b/src/starsim/render/realtime.py
+@@ -66,30 +66,37 @@
+         self._hits = 0
+         self._misses = 0
+     
+-    def get(self, frame_id: int) -> Optional[np.ndarray]:
+-        """Get frame from cache (LRU)."""
++    def get(self, frame_id: int, with_truth: bool = False):
++        """Get frame from cache (LRU), or None.
++
++        with_truth=False (varsayilan): upstream ile ayni sozlesme, sadece
++        kareyi dondurur. with_truth=True: (frame, truth) demeti dondurur.
++        """
+         with self._lock:
+-            for cached_id, frame in self._cache:
++            for item in self._cache:
++                cached_id, frame, truth = item
+                 if cached_id == frame_id:
+                     self._hits += 1
+                     # Move to end (most recent)
+-                    self._cache.remove((cached_id, frame))
+-                    self._cache.append((cached_id, frame))
++                    self._cache.remove(item)
++                    self._cache.append(item)
++                    if with_truth:
++                        return frame.copy(), truth
+                     return frame.copy()
+             self._misses += 1
+             return None
+     
+-    def put(self, frame_id: int, frame: np.ndarray):
+-        """Put frame into cache (evicts oldest if full)."""
++    def put(self, frame_id: int, frame: np.ndarray, truth=None):
++        """Put (frame, truth) into cache (evicts oldest if full)."""
+         with self._lock:
+             # Remove if exists (update)
+-            for cached_id, _ in list(self._cache):
+-                if cached_id == frame_id:
+-                    self._cache.remove((cached_id, _))
++            for item in list(self._cache):
++                if item[0] == frame_id:
++                    self._cache.remove(item)
+                     break
+             
+-            # Add new frame
+-            self._cache.append((frame_id, frame.copy()))
++            # Add new frame + ground truth
++            self._cache.append((frame_id, frame.copy(), truth))
+             
+             # Check memory usage
+             self._check_memory_limit()
+@@ -100,7 +107,7 @@
+             return
+         
+         # Estimate memory (rough)
+-        _, sample_frame = self._cache[0]
++        _, sample_frame, _ = self._cache[0]
+         frame_size_mb = sample_frame.nbytes / (1024 * 1024)
+         total_mb = frame_size_mb * len(self._cache)
+         
+@@ -316,9 +323,11 @@
+             add_noise = self.scenario_config.add_noise
+             seed = self.scenario_config.seed
+         
+-        # Apply motion rates based on elapsed time
+-        import time
+-        elapsed_time = time.time() - self._start_time if self._start_time > 0 else 0.0
++        # Apply motion rates based on FRAME INDEX (deterministik).
++        # time.time() yerine frame_counter kullaniyoruz: ayni frame_id HER ZAMAN
++        # ayni pointing'i -> ayni ground truth'u verir. Kare dusse/gec islense bile
++        # starsim-centroid-tracker'nin gordugu kare ile ground truth birebir eslesir.
++        elapsed_time = self._frame_counter / float(self.config.target_fps)
+         
+         ra = ra_base + (ra_rate * elapsed_time)
+         dec = dec_base + (dec_rate * elapsed_time)
+@@ -372,7 +381,7 @@
+         
+         # Render (motion-blur trails derived from the same ra/dec/roll rates
+         # already used to advance the boresight between frames)
+-        frame = renderer.render(
++        frame, truth = renderer.render(
+             stars=stars,
+             add_noise=add_noise,
+             seed=seed,
+@@ -380,9 +389,10 @@
+             ra_rate=ra_rate,
+             dec_rate=dec_rate,
+             roll_rate=roll_rate,
++            return_truth=True,
+         )
+         
+-        return frame, ra, dec, roll
++        return frame, ra, dec, roll, truth
+ 
+     def add_overlay_callback(self, callback: Callable[[np.ndarray, dict], np.ndarray]):
+         """Add overlay callback (e.g., for I, S, P overlays).
+@@ -410,11 +420,11 @@
+             current_time = self._frame_counter * target_frame_time
+             
+             # Check cache first
+-            cached_frame = self.cache.get(self._frame_counter)
++            cached = self.cache.get(self._frame_counter, with_truth=True)
+             
+-            if cached_frame is not None:
++            if cached is not None:
+                 # Cache hit — compute current pointing for metadata
+-                frame = cached_frame
++                frame, truth = cached
+                 render_time = 0.0
+                 with self._state_lock:
+                     _ra_base = self.scenario_config.ra
+@@ -423,16 +433,16 @@
+                     _ra_rate = self.scenario_config.ra_rate
+                     _dec_rate = self.scenario_config.dec_rate
+                     _roll_rate = self.scenario_config.roll_rate
+-                _elapsed = time.time() - self._start_time if self._start_time > 0 else 0.0
++                _elapsed = self._frame_counter / float(self.config.target_fps)
+                 ra = (_ra_base + _ra_rate * _elapsed) % 360.0
+                 dec = reflect_declination(_dec_base + _dec_rate * _elapsed)
+                 roll = (_roll_base + _roll_rate * _elapsed) % 360.0
+             else:
+-                # Cache miss - render new frame (returns actual ra/dec/roll used)
++                # Cache miss - render new frame (returns actual ra/dec/roll used + truth)
+                 render_start = time.perf_counter()
+-                frame, ra, dec, roll = self._render_frame_internal()
++                frame, ra, dec, roll, truth = self._render_frame_internal()
+                 render_time = time.perf_counter() - render_start
+-                self.cache.put(self._frame_counter, frame)
++                self.cache.put(self._frame_counter, frame, truth)
+ 
+             # Apply overlays (always real-time)
+             metadata = {
+@@ -441,6 +451,7 @@
+                 "ra": ra,
+                 "dec": dec,
+                 "roll": roll,
++                "truth": truth,   # ground truth: [(x, y, mag), ...]  (dogrulama icin)
+             }
+             
+             with self._state_lock:
+--- a/src/starsim/gui/main_window.py
++++ b/src/starsim/gui/main_window.py
+@@ -29,6 +29,7 @@
+ from .realtime_widget import RealTimeModeWidget
+ from .second_monitor import SecondMonitorWindow
+ from ..render.realtime import RealTimeRenderer, RealTimeConfig
++from .fifo_tap import FifoFrameWriter
+ from ..render.overlay import OverlayManager, create_overlay_callback
+ from ..io.config import RenderScenarioConfig
+ 
+@@ -46,6 +47,7 @@
+         self._current_file: Optional[str] = None
+         self._render_thread: Optional[RenderThread] = None
+         self._realtime_renderer: Optional[RealTimeRenderer] = None
++        self._fifo_tap: Optional[FifoFrameWriter] = None  # starsim-centroid-tracker koprusu (STARSIM_FIFO ile aktiflesir)
+         self._overlay_manager: Optional[OverlayManager] = None
+         self._realtime_restart_timer: Optional['QTimer'] = None  # Debounce timer
+         self._initial_params = initial_params
+@@ -1652,6 +1654,12 @@
+             self._start_realtime_rendering()
+         else:
+             self._stop_realtime_rendering()
++            # starsim-centroid-tracker koprusunu SADECE kullanici real-time'i tamamen kapatinca kapat.
++            # (FOV/cozunurluk degisimindeki ic restart _stop_realtime_rendering'i
++            #  cagirir ama tap'i kapatmamaliyiz; starsim-centroid-tracker kesintisiz devam etsin.)
++            if self._fifo_tap is not None:
++                self._fifo_tap.close()
++                self._fifo_tap = None
+     
+     def _start_realtime_rendering(self):
+         """Start real-time rendering."""
+@@ -1720,7 +1728,20 @@
+         self._realtime_timer = QTimer()
+         self._realtime_timer.timeout.connect(self._update_realtime_frame)
+         self._realtime_timer.start(16)  # ~60 FPS
+-        
++
++        # --- starsim-centroid-tracker koprusu: STARSIM_FIFO ortam degiskeni varsa muslugu ac ---
++        # Ayni renderer instance'i restart edilse bile musluk _update_realtime_frame
++        # icinde besledigi icin kalici kalir; sadece bir kez olusturulur.
++        if self._fifo_tap is None:
++            fifo_path = os.environ.get("STARSIM_FIFO")
++            if fifo_path:
++                try:
++                    gt_path = os.environ.get("STARSIM_GT")  # dogrulama icin ground truth CSV
++                    self._fifo_tap = FifoFrameWriter(fifo_path, gt_path=gt_path)
++                except Exception as e:
++                    print(f"[RealTime] FIFO musluk acilamadi: {e}")
++                    self._fifo_tap = None
++
+         self._update_status("Real-time rendering started (60 FPS)")
+     
+     def _stop_realtime_rendering(self):
+@@ -1822,6 +1843,13 @@
+                     frame_id=metadata.get('frame_id'),
+                 )
+             self._image_viewer.set_image(frame)
++            # starsim-centroid-tracker koprusu: kare + ground truth + GERCEK kare-id'yi yolla.
++            if self._fifo_tap is not None:
++                self._fifo_tap.submit(
++                    frame,
++                    truth=metadata.get('truth') if metadata else None,
++                    frame_id=(metadata.get('frame_id') if metadata else frame_id),
++                )
+             self._refresh_active_overlays()
+ 
+             # Update histogram if visible

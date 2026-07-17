@@ -1,0 +1,20 @@
+# derleme ciktilari
+build/
+tracker
+gen_frames
+*.o
+
+# python
+__pycache__/
+*.pyc
+
+# uretilen test/veri dosyalari
+*.bin
+centroids.csv
+ground_truth.csv
+cikti.csv
+
+# yerel sonuc klasorleri
+otomasyon_sonuclari/
+sonuclar/
+mc_sonuclari/
